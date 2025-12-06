@@ -1,9 +1,11 @@
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.tools import (
@@ -14,13 +16,34 @@ from src.tools import (
 )
 
 
+def get_openrouter_llm(model: str = "x-ai/grok-4.1-fast"):
+    """Create a ChatOpenAI instance configured for OpenRouter."""
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "OPENROUTER_API_KEY environment variable is required. "
+            "Get your key from https://openrouter.ai/keys"
+        )
+    
+    return ChatOpenAI(
+        model=model,
+        openai_api_key=api_key,
+        openai_api_base="https://openrouter.ai/api/v1",
+        default_headers={
+            "HTTP-Referer": "https://github.com/your-repo",  # Optional: for analytics
+            "X-Title": "Clinical Supply Chain AI",  # Optional: for analytics
+        },
+        temperature=0.7,
+    )
+
+
 @dataclass
 class AgentState:
     """Shared state across all agents."""
 
     trigger_source: str  # "cron" or "user"
     user_query: Optional[str]
-    selected_agent: Optional[str] = None
+    selected_agent: Optional[str] = None #supply_watchdog 
     extracted_entities: Dict = field(default_factory=dict)
     sql_queries: List[str] = field(default_factory=list)
     query_results: List[Dict] = field(default_factory=list)
@@ -33,9 +56,7 @@ class OrchestratorAgent:
     """Routes requests to appropriate specialist agents."""
 
     def __init__(self):
-        self.llm = ChatAnthropic(
-            model="claude-sonnet-4-20250514",
-        )
+        self.llm = get_openrouter_llm(model="x-ai/grok-4.1-fast")
 
     def invoke(self, state: AgentState) -> AgentState:
         """Classify intent and route to appropriate agent."""
@@ -90,42 +111,40 @@ class SupplyWatchdogAgent:
     """Autonomous monitoring agent for daily health checks."""
 
     def __init__(self):
-        self.llm = ChatAnthropic(
-            model="claude-sonnet-4-20250514",
-        )
+        self.llm = get_openrouter_llm(model="x-ai/grok-4.1-fast")
         self.tools = [run_sql_query, calculate_runway, send_alert]
 
     def invoke(self, state: AgentState) -> AgentState:
         """Run daily supply chain health check."""
 
-        # Expiry risk query
+        # Expiry risk query - using lot_status_report table
         expiry_query = """
 SELECT 
-    am."Material Number" as batch_id,
-    am."Trial Name" as trial,
-    am."Expiry Date" as expiry_date,
-    am."Quantity Reserved" as quantity_at_risk,
-    EXTRACT(DAY FROM (am."Expiry Date" - CURRENT_DATE)) as days_remaining,
+    ls."Lot Number" as batch_id,
+    ls."Trial Alias" as trial,
+    ls."Expiration Date" as expiry_date,
+    ls."Country" as country,
+    ROUND((julianday(ls."Expiration Date") - julianday(date('now')))) as days_remaining,
     CASE 
-        WHEN am."Expiry Date" <= CURRENT_DATE + INTERVAL '30 days' THEN 'Critical'
-        WHEN am."Expiry Date" <= CURRENT_DATE + INTERVAL '60 days' THEN 'High'
+        WHEN date(ls."Expiration Date") <= date(date('now'), '+30 days') THEN 'Critical'
+        WHEN date(ls."Expiration Date") <= date(date('now'), '+60 days') THEN 'High'
         ELSE 'Medium'
     END as risk_level
-FROM allocated_materials am
-WHERE am."Expiry Date" <= CURRENT_DATE + INTERVAL '90 days'
-  AND am."Quantity Reserved" > 0
-ORDER BY am."Expiry Date" ASC;
+FROM lot_status_report ls
+WHERE date(ls."Expiration Date") <= date(date('now'), '+90 days')
+ORDER BY ls."Expiration Date" ASC;
 """
 
         expiry_result = run_sql_query.invoke({"query": expiry_query})
 
-        # Shortfall prediction query
+        # Shortfall prediction query - using Initial Qty from available_inventory_report
         shortfall_query = """
 WITH Trial_Supply AS (
     SELECT 
         "Trial Name" as trial_id,
-        SUM("Quantity Available") as total_stock
+        SUM("Initial Qty") as total_stock
     FROM available_inventory_report
+    WHERE "Initial Qty" > 0
     GROUP BY "Trial Name"
 ),
 Trial_Demand AS (
@@ -133,16 +152,17 @@ Trial_Demand AS (
         "trial_alias" as trial_id,
         "enrollment_rate_monthly_actual" as monthly_rate
     FROM study_level_enrollment_report
+    WHERE "enrollment_rate_monthly_actual" > 0
 )
 SELECT 
     s.trial_id,
     s.total_stock,
     d.monthly_rate,
-    ROUND(d.monthly_rate / 4, 2) as weekly_burn_rate,
-    ROUND(s.total_stock / NULLIF((d.monthly_rate / 4), 0), 1) as weeks_of_coverage
+    ROUND(d.monthly_rate / 4.0, 2) as weekly_burn_rate,
+    ROUND(s.total_stock / NULLIF((d.monthly_rate / 4.0), 0), 1) as weeks_of_coverage
 FROM Trial_Supply s
 INNER JOIN Trial_Demand d ON s.trial_id = d.trial_id
-WHERE (s.total_stock / NULLIF((d.monthly_rate / 4), 0)) < 8
+WHERE (s.total_stock / NULLIF((d.monthly_rate / 4.0), 0)) < 8
 ORDER BY weeks_of_coverage ASC;
 """
 
@@ -188,9 +208,7 @@ class ScenarioStrategistAgent:
     """Conversational agent for extension feasibility analysis."""
 
     def __init__(self):
-        self.llm = ChatAnthropic(
-            model="claude-sonnet-4-20250514",
-        )
+        self.llm = get_openrouter_llm(model="x-ai/grok-4.1-fast")
         self.tools = [run_sql_query, search_trial_by_name]
 
     def invoke(self, state: AgentState) -> AgentState:
@@ -200,7 +218,6 @@ class ScenarioStrategistAgent:
         batch_number = entities.get("batch_number")
         trial_id = entities.get("trial_id")
         country = entities.get("country")
-
         if not all([batch_number, trial_id, country]):
             state.final_output = {
                 "decision": "REJECTED",
@@ -211,12 +228,13 @@ class ScenarioStrategistAgent:
 
         # Gate 1: Technical
         tech_query = f"""
-SELECT "Sample Status", "Test Result", "Re-eval Date"
+SELECT 
+    "Sample Status (NDP Material Coordinator to Complete)" as sample_status,
+    "Lot Number (Molecule Planner to Complete)" as lot_number,
+    "Modified Date" as modified_date
 FROM re_evaluation
-WHERE "Lot Number" = '{batch_number}'
-  AND "Sample Status" = 'Complete'
-  AND "Test Result" = 'Pass'
-ORDER BY "Re-eval Date" DESC
+WHERE "Lot Number (Molecule Planner to Complete)" = '{batch_number}'
+  AND "Sample Status (NDP Material Coordinator to Complete)" = 'Complete'
 LIMIT 1;
 """
         tech_result = run_sql_query.invoke({"query": tech_query})
@@ -242,13 +260,13 @@ LIMIT 1;
             }
             return state
 
-        # Gate 2: Regulatory
+        # Gate 2: Regulatory - using health_authority_division_c instead of country
         reg_query = f"""
-SELECT "submission_outcome", "approval_date"
+SELECT "submission_outcome", "approved_date_c" as approval_date
 FROM rim
 WHERE "clinical_study_v" = '{trial_id}'
-  AND "country" = '{country}'
-  AND "submission_outcome" = 'Approved';
+  AND "submission_outcome" IN ('Accepted', 'Approved')
+LIMIT 1;
 """
         reg_result = run_sql_query.invoke({"query": reg_query})
 
@@ -273,13 +291,23 @@ WHERE "clinical_study_v" = '{trial_id}'
             }
             return state
 
-        # Gate 3: Logistics
+        # Gate 3: Logistics - extract days from ip_timeline string
         log_query = f"""
-SELECT "ip_timeline_days"
+SELECT "ip_timeline", "country_name"
 FROM ip_shipping_timelines_report
-WHERE "country_name" = '{country}';
+WHERE "country_name" LIKE '%{country}%'
+LIMIT 1;
 """
         log_result = run_sql_query.invoke({"query": log_query})
+        
+        # Parse days from timeline string (e.g., "6 days door-to-door" -> 6)
+        shipping_days = 14  # Default fallback
+        if log_result.get("success") and log_result.get("data"):
+            timeline_str = log_result["data"][0].get("ip_timeline", "")
+            import re
+            match = re.search(r'(\d+)\s*days?', timeline_str, re.IGNORECASE)
+            if match:
+                shipping_days = int(match.group(1))
 
         if not log_result.get("success") or not log_result.get("data"):
             state.final_output = {
@@ -302,7 +330,6 @@ WHERE "country_name" = '{country}';
             }
             return state
 
-        shipping_days = log_result["data"][0]["ip_timeline_days"]
         buffer_days = 14
         # Placeholder for actual expiry math; keep scenario conservative
         time_available = 30

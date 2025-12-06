@@ -4,7 +4,7 @@
 
 **Global Pharma Inc.** faces critical risks in stock-outs and inventory waste due to fragmented data across 40+ tables. This solution implements an **Autonomous Agentic System** to mitigate these risks.
 
-We utilize a **Hub-and-Spoke Multi-Agent Architecture** built on **LangGraph** and **Anthropic Claude**. This ensures separation of concerns, allowing specialized agents to handle high-volume monitoring (**The Watchdog**) and complex decision support (**The Strategist**) without context window overflow, while remaining production-ready for Postgres and n8n orchestration.
+We utilize a **Hub-and-Spoke Multi-Agent Architecture** built on **LangGraph** and **OpenRouter** (using Grok models). This ensures separation of concerns, allowing specialized agents to handle high-volume monitoring (**The Watchdog**) and complex decision support (**The Strategist**) without context window overflow, while remaining production-ready for Postgres and n8n orchestration.
 
 ---
 
@@ -267,13 +267,12 @@ pip install -r requirements.txt
 - Export environment variables (or adjust `DB_CONFIG` in `src/tools.py`):
 
 ```bash
-export DB_HOST=localhost
-export DB_NAME=clinical_supply_chain
-export DB_USER=postgres
-export DB_PASSWORD=your_password
-export DB_PORT=5432
-export ANTHROPIC_API_KEY=your_api_key
+export OPENROUTER_API_KEY=your_openrouter_api_key
 ```
+
+**Note:** For local demo, you only need the `OPENROUTER_API_KEY`. The database uses SQLite with CSV loading (no Postgres setup required).
+
+Get your OpenRouter API key from: https://openrouter.ai/keys
 
 3. **Run the LangGraph demo:**
 
@@ -281,16 +280,23 @@ export ANTHROPIC_API_KEY=your_api_key
 python -m src.main
 ```
 
+**Note:** The code is configured to use **SQLite with CSV loading** for local demo. It will automatically:
+- Load all CSVs from the `data/` folder into an in-memory SQLite database
+- Convert PostgreSQL-specific SQL syntax to SQLite-compatible queries
+- Work without requiring a separate PostgreSQL server
+
 You will see:
 
 - A **cron-style health check** run by the Supply Watchdog.
 - A **user-driven scenario** for extension feasibility, executed by the Scenario Strategist.
 
+**For Production:** Set environment variables (`DB_HOST`, `DB_NAME`, etc.) to use PostgreSQL instead of SQLite.
+
 4. **(Optional) Import the n8n workflow:**
 
 - Open n8n.
 - Import `workflows/n8n-workflow.json`.
-- Configure Postgres and Anthropic credentials in n8n’s UI.
+- Configure Postgres and OpenRouter credentials in n8n's UI.
 - Trigger the cron or webhook nodes to see the visual orchestration of the same business logic.
 
 

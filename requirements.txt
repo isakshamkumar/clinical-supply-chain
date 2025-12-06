@@ -1,8 +1,9 @@
-langgraph==0.0.26
-langchain==0.1.0
-langchain-anthropic==0.1.0
-psycopg2-binary==2.9.9
-chromadb==0.4.22
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+chromadb>=0.4.22
+pandas>=2.0.0
 
 
 
